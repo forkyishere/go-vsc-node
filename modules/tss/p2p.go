@@ -7,14 +7,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
-"vsc-node/modules/common"
+	"vsc-node/modules/common"
 
 	libp2p "vsc-node/modules/p2p"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	multiaddr "github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multicodec"
 	blsu "github.com/protolambda/bls12-381-util"
 )
@@ -202,6 +204,21 @@ func (txp *TssManager) stopP2P() error {
 	return nil
 }
 
+func (tss *TssManager) callRPCWithSingleAddr(peerID peer.ID, addr multiaddr.Multiaddr, tMsg *TMsg, tRes *TRes) error {
+    ps := tss.p2p.Host().Peerstore()
+
+    originalAddrs := ps.Addrs(peerID)
+    originalTTL := ps.AddrsTTL(peerID)
+
+    ps.SetAddrs(peerID, []multiaddr.Multiaddr{addr}, peerstore.PermanentAddrTTL)
+
+    defer func() {
+        ps.SetAddrs(peerID, originalAddrs, originalTTL)
+    }()
+
+    return tss.client.Call(peerID, "vsc.tss", "ReceiveMsg", tMsg, tRes)
+}
+
 // SendMsg sends a TSS message to a participant with retry logic and connection health checks
 func (tss *TssManager) SendMsg(sessionId string, participant Participant, moniker string, msg []byte, isBroadcast bool, commiteeType string, cmtFrom string) error {
 	return tss.sendMsgWithRetry(sessionId, participant, moniker, msg, isBroadcast, commiteeType, cmtFrom, 0)
@@ -230,6 +247,13 @@ func (tss *TssManager) sendMsgWithRetry(sessionId string, participant Participan
 			"sessionId", sessionId, "from", fromAccount, "to", participant.Account, "peerId", witness.PeerId, "err", err)
 		return err
 	}
+
+    // Cycle through different addresses on each retry
+	allAddrs := tss.p2p.Host().Peerstore().Addrs(peerId)
+    if len(allAddrs) == 0 {
+        return fmt.Errorf("no addresses known for peer %s", peerId)
+    }
+    targetAddr := allAddrs[attempt%len(allAddrs)]
 
 	// Check connection health before sending
 	if !tss.isPeerConnected(peerId) {
@@ -267,7 +291,7 @@ func (tss *TssManager) sendMsgWithRetry(sessionId string, participant Participan
 	// Add timeout to RPC call using a channel
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- tss.client.Call(peerId, "vsc.tss", "ReceiveMsg", &tMsg, &tRes)
+		errChan <- tss.callRPCWithSingleAddr(peerId, targetAddr, &tMsg, &tRes)
 	}()
 
 	select {
